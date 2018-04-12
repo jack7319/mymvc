@@ -1,9 +1,6 @@
 package com.bizideal.mn.core;
 
-import com.bizideal.mn.annotation.MyAutowired;
-import com.bizideal.mn.annotation.MyController;
-import com.bizideal.mn.annotation.MyRequestMapping;
-import com.bizideal.mn.annotation.MyService;
+import com.bizideal.mn.annotation.*;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -15,7 +12,9 @@ import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.File;
 import java.io.IOException;
+import java.lang.annotation.Annotation;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.util.HashMap;
@@ -39,7 +38,7 @@ public class MyDispatcherServlet extends HttpServlet {
     // 实例化的bean
     private Map<String, Object> singletonObjects = new HashMap<>();
 
-    private Map<String, Object> handlerMapping = new HashMap<>();
+    private Map<String, HandlerEntity> handlerMapping = new HashMap<>();
 
     public MyDispatcherServlet() {
         super();
@@ -56,6 +55,18 @@ public class MyDispatcherServlet extends HttpServlet {
         doAutowired();
 
         doHandlerMapping();
+    }
+
+    private class HandlerEntity {
+        Object controllerObj;
+        Method method;
+        Map<String, Integer> paramsMap;
+
+        public HandlerEntity(Object controllerObj, Method method, Map<String, Integer> paramsMap) {
+            this.controllerObj = controllerObj;
+            this.method = method;
+            this.paramsMap = paramsMap;
+        }
     }
 
     private void doHandlerMapping() {
@@ -80,6 +91,42 @@ public class MyDispatcherServlet extends HttpServlet {
                 }
                 MyRequestMapping annotation = method.getAnnotation(MyRequestMapping.class);
                 String value = annotation.value();
+                String requestPath = path + "/" + value;
+                requestPath = requestPath.replaceAll("/+", "/");
+                // 获取所有的参数
+                String[] params = Play.getMethodParameterNamesByAsm4(clazz, method);
+                // 获取参数注解
+                Annotation[][] annotations = method.getParameterAnnotations();
+                // 方法的参数类型
+                Class<?>[] parameterTypes = method.getParameterTypes();
+                Map<String, Integer> paramMap = new HashMap<>();
+                for (int i = 0; i < annotations.length; i++) {
+                    Annotation[] a = annotations[i];
+                    if (a.length == 0) {
+                        // 没有注解
+                        Class<?> parameterType = parameterTypes[i];
+                        if (parameterType == HttpServletRequest.class || parameterType == HttpServletResponse.class) {
+                            paramMap.put(parameterType.getName(), i);
+                        } else {
+                            paramMap.put(params[i], i);
+                        }
+                        continue;
+                    }
+                    // 有注解
+                    for (Annotation an : a) {
+                        if (an.annotationType() == MyRequestParam.class) {
+                            String value1 = ((MyRequestParam) an).value();
+                            if (!"".equals(value1.trim())) {
+                                paramMap.put(value1, i);
+                            } else {
+                                // 没有指定value，还是用取出的param
+                                paramMap.put(params[i], i);
+                            }
+                        }
+                    }
+                    HandlerEntity handlerEntity = new HandlerEntity(controller, method, paramMap);
+                    handlerMapping.put(requestPath, handlerEntity);
+                }
             }
         }
     }
@@ -193,7 +240,59 @@ public class MyDispatcherServlet extends HttpServlet {
 
     @Override
     protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
-        out(resp, "11111");
+        doInvoke(req, resp);
+    }
+
+    private void doInvoke(HttpServletRequest req, HttpServletResponse resp) {
+        String requestURI = req.getRequestURI();
+        if (handlerMapping.containsKey(requestURI)) {
+            HandlerEntity o = handlerMapping.get(requestURI);
+            Class<?>[] parameterTypes = o.method.getParameterTypes();
+            try {
+                Map<String, Integer> paramsMap = o.paramsMap;
+                Object[] params = new Object[paramsMap.size()];
+                for (Map.Entry<String, Integer> entry : paramsMap.entrySet()) {
+                    String paramName = entry.getKey();
+                    if (paramName.equals(HttpServletRequest.class.getName())) {
+                        params[entry.getValue()] = req;
+                    } else if (paramName.equals(HttpServletResponse.class.getName())) {
+                        params[entry.getValue()] = resp;
+                    } else {
+                        String parameter = req.getParameter(paramName);
+                        if (null != parameter) {
+                            params[entry.getValue()] = convert(parameter, parameterTypes[entry.getValue()]);
+                        }
+                    }
+                }
+                Object invoke = o.method.invoke(o.controllerObj, params);
+            } catch (Exception e) {
+                logger.error("调用出错..", e);
+            }
+        } else {
+            resp.setStatus(404);
+        }
+    }
+
+    /**
+     * 将用户传来的参数转换为方法需要的参数类型
+     */
+    private Object convert(String parameter, Class<?> targetType) {
+        if (targetType == String.class) {
+            return parameter;
+        } else if (targetType == Integer.class || targetType == int.class) {
+            return Integer.valueOf(parameter);
+        } else if (targetType == Long.class || targetType == long.class) {
+            return Long.valueOf(parameter);
+        } else if (targetType == Boolean.class || targetType == boolean.class) {
+            if (parameter.toLowerCase().equals("true") || parameter.equals("1")) {
+                return true;
+            } else if (parameter.toLowerCase().equals("false") || parameter.equals("0")) {
+                return false;
+            }
+            throw new RuntimeException("不支持的参数");
+        } else {
+            return null;
+        }
     }
 
     private void out(HttpServletResponse response, String str) {
